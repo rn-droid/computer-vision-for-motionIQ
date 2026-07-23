@@ -11,16 +11,16 @@
   },
   "input_shape": [
     41,
-    34
+    42
   ],
   "window_size": 41,
   "num_keypoints": 13,
   "normalization": "divide_by_max_dim",
-  "test_accuracy": 0.9116607904434204,
-  "test_loss": 0.2718231976032257,
-  "macro_f1": 0.9102975031697066,
-  "train_samples": 5748,
+  "test_accuracy": 0.914893627166748,
+  "test_loss": 0.28460150957107544,
+  "macro_f1": 0.9139842328684051,
+  "train_samples": 5742,
   "val_samples": 170,
-  "test_samples": 283,
-  "experiment_dir": "D:\\College\\yuvaudhyami\\stup\\MVP\\software\\cv_model\\runs\\experiment_004"
+  "test_samples": 282,
+  "experiment_dir": "D:\\College\\yuvaudhyami\\stup\\MVP\\software\\cv_model\\runs\\experiment_005"
 }

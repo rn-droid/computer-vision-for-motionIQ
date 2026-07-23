@@ -1,0 +1,33 @@
+{
+  "lr": 0.001,
+  "batch_size": 32,
+  "epochs": 100,
+  "dropout": 0.3,
+  "window_size": 41,
+  "window_stride": 10,
+  "lstm_units": 128,
+  "conv_filters_1": 64,
+  "conv_filters_2": 128,
+  "optimizer": "adam",
+  "weight_decay": 0.0001,
+  "augment": true,
+  "seed": 42,
+  "patience_early_stop": 20,
+  "patience_reduce_lr": 7,
+  "min_lr": 1e-07,
+  "reduce_lr_factor": 0.5,
+  "max_per_class": 500,
+  "mode": "side",
+  "pretrained": "",
+  "resume": "",
+  "input_shape": [
+    41,
+    42
+  ],
+  "num_classes": 3,
+  "train_samples_raw": 957,
+  "train_samples_augmented": 5742,
+  "val_samples": 170,
+  "test_samples": 282,
+  "timestamp": "2026-07-24 01:09:19"
+}

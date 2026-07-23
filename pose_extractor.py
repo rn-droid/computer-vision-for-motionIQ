@@ -328,31 +328,54 @@ class PoseExtractor:
                     frame_poses.append(fp)
 
                 # ── Robust Dynamic Tracking (Movement-Based) ──
-                # Assign to existing tracks if close enough, else spawn new track
+                # Assign to existing tracks if close enough, else spawn new track.
+                #
+                # Match threshold scales with how much time actually elapsed since
+                # the last processed frame (frame_skip / fps). A fixed threshold
+                # tuned for frame_skip=1 will fragment or swap tracks whenever
+                # frame_skip > 1, since players cover proportionally more ground
+                # between processed frames.
                 next_track_id = max(track_id_frames.keys()) + 1 if track_id_frames else 0
-                
+
+                def _sq_dist(pos_a, pos_b) -> float:
+                    dx = (pos_a[0] - pos_b[0]) / frame_w
+                    dy = (pos_a[1] - pos_b[1]) / frame_h
+                    return dx * dx + dy * dy
+
+                # ~14% of screen per processed frame at frame_skip=1; scales
+                # quadratically with frame_skip since displacement scales linearly
+                # with elapsed time.
+                match_threshold = 0.02 * (frame_skip ** 2)
+
                 unmatched_poses = frame_poses.copy()
-                
-                # Try matching existing tracks first
+
+                # Build every (track, pose) candidate pair within threshold, then
+                # assign globally best-first (greedy matching), instead of looping
+                # over tracks in arbitrary dict order and letting the first track
+                # considered claim its nearest pose regardless of whether another
+                # track is a better fit for it. This avoids ID swaps when two
+                # players cross paths.
+                candidate_pairs = []
                 for p_idx, last_pos in last_positions.items():
-                    if not unmatched_poses:
-                        break
-                        
-                    def _dist(p: FramePose) -> float:
-                        dx = (p.center_x - last_pos[0]) / frame_w
-                        dy = (p.center_y - last_pos[1]) / frame_h
-                        return dx*dx + dy*dy
-                        
-                    unmatched_poses.sort(key=_dist)
-                    best_match = unmatched_poses[0]
-                    
-                    # 0.02 squared distance = ~14% of screen jump in a single frame
-                    if _dist(best_match) < 0.02:
-                        best_match.person_id = p_idx
-                        track_id_frames[p_idx].append(best_match)
-                        last_positions[p_idx] = (best_match.center_x, best_match.center_y)
-                        unmatched_poses.pop(0)
-                
+                    for pose in unmatched_poses:
+                        d = _sq_dist((pose.center_x, pose.center_y), last_pos)
+                        if d < match_threshold:
+                            candidate_pairs.append((d, p_idx, pose))
+                candidate_pairs.sort(key=lambda x: x[0])
+
+                matched_track_ids = set()
+                matched_pose_ids = set()
+                for d, p_idx, pose in candidate_pairs:
+                    if p_idx in matched_track_ids or id(pose) in matched_pose_ids:
+                        continue
+                    pose.person_id = p_idx
+                    track_id_frames[p_idx].append(pose)
+                    last_positions[p_idx] = (pose.center_x, pose.center_y)
+                    matched_track_ids.add(p_idx)
+                    matched_pose_ids.add(id(pose))
+
+                unmatched_poses = [p for p in unmatched_poses if id(p) not in matched_pose_ids]
+
                 # Any remaining unmatched poses get a new track ID
                 for p in unmatched_poses:
                     # Ignore really low confidence ghosts before creating new tracks

@@ -15,6 +15,7 @@ showing the detected skeleton and predicted shot label.
 """
 
 import os
+import math
 import sys
 import cv2
 import numpy as np
@@ -32,6 +33,31 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────
 
 SHOT_CLASSES = ['clear', 'drop', 'smash']
+
+# ─────────────────────────────────────────────────────────────────────
+# Biomechanical Shot Detection Gate
+# ─────────────────────────────────────────────────────────────────────
+# A real badminton stroke (smash, clear, drop) requires a fast arm swing.
+# These thresholds are in normalized-coordinate units per second.  With
+# max-dim normalization the full frame diagonal is ~1.0, and a player's
+# arm span is roughly 0.3–0.5 of the frame height.  During a real stroke
+# the dominant wrist easily moves at 2–5 units/sec (normalized) and
+# accelerates at 30+ units/sec².  During footwork / walking the wrist
+# drifts at < 0.8 units/sec.  We set conservative thresholds so that
+# any genuine stroke passes but idle movement is rejected.
+#
+# SWING_SPEED_THRESHOLD: minimum peak wrist speed (units/sec) in the
+#   window for us to trust the LSTM's prediction.  Below this we assume
+#   the player is not hitting.
+# SWING_ACCEL_THRESHOLD: minimum peak wrist acceleration (units/sec²).
+#   Explosive strokes always have a sharp velocity spike even if the
+#   peak speed is modest (e.g. a soft drop from a high preparation).
+#
+# A window must exceed AT LEAST ONE of these two thresholds to be
+# classified as a shot.  If neither is exceeded the window is labeled
+# "no_shot".
+SWING_SPEED_THRESHOLD = 1.2    # units/sec (normalized coords)
+SWING_ACCEL_THRESHOLD = 15.0   # units/sec²
 
 # Skeleton connections for drawing (indices into the 13-keypoint array)
 # Mapping: 0=nose, 1=L_shoulder, 2=R_shoulder, 3=L_elbow, 4=R_elbow,
@@ -66,16 +92,18 @@ DEFAULT_SIDE_MODEL_PATH = Path(__file__).resolve().parent / "models" / "shot_cla
 @dataclass
 class ShotPrediction:
     """Result of a shot classification."""
-    shot_type: str              # e.g. "smash"
+    shot_type: str              # e.g. "smash" or "no_shot"
     confidence: float           # 0.0 – 1.0
     all_probabilities: Dict[str, float] = field(default_factory=dict)
     player_id: str = ""
     frame_range: Tuple[int, int] = (0, 0)
+    is_shot: bool = True        # False when the biomechanical gate rejected this window
 
     def __repr__(self):
+        tag = '' if self.is_shot else ' [NO SHOT]'
         return (
             f"ShotPrediction('{self.shot_type}' @ {self.confidence:.1%}, "
-            f"player='{self.player_id}', frames={self.frame_range})"
+            f"player='{self.player_id}', frames={self.frame_range}{tag})"
         )
 
 
@@ -128,33 +156,98 @@ class LSTMShotModel:
 
         logger.info("LSTM model loaded successfully.")
 
-    def predict(self, keypoint_sequence: np.ndarray) -> ShotPrediction:
+    @staticmethod
+    def _check_swing_gate(keypoint_sequence: np.ndarray, frame_skip: int = 2,
+                          fps: float = 30.0) -> Tuple[bool, float, float]:
+        """
+        Biomechanical gate: check whether the keypoint window contains a
+        genuine arm swing by measuring peak wrist speed and acceleration.
+
+        Returns:
+            (is_shot, peak_speed, peak_accel)
+        """
+        from cv_model.features import R_WRI, L_WRI, _is_valid
+
+        T = keypoint_sequence.shape[0]
+        dt = frame_skip / fps
+
+        # Compute wrist speeds for both hands
+        speeds = np.zeros(T, dtype=np.float32)
+        for t in range(1, T):
+            best_speed = 0.0
+            for wri_idx in (R_WRI, L_WRI):
+                curr = keypoint_sequence[t, wri_idx]
+                prev = keypoint_sequence[t - 1, wri_idx]
+                if _is_valid(curr) and _is_valid(prev):
+                    dx = float(curr[0] - prev[0]) / dt
+                    dy = float(curr[1] - prev[1]) / dt
+                    spd = math.hypot(dx, dy)
+                    best_speed = max(best_speed, spd)
+            speeds[t] = best_speed
+
+        # Compute acceleration (derivative of speed)
+        accels = np.zeros(T, dtype=np.float32)
+        for t in range(2, T):
+            accels[t] = abs(speeds[t] - speeds[t - 1]) / dt
+
+        peak_speed = float(np.max(speeds))
+        peak_accel = float(np.max(accels))
+
+        is_shot = (peak_speed >= SWING_SPEED_THRESHOLD or
+                   peak_accel >= SWING_ACCEL_THRESHOLD)
+
+        return is_shot, peak_speed, peak_accel
+
+    def predict(self, keypoint_sequence: np.ndarray,
+                frame_skip: int = 2, fps: float = 30.0) -> ShotPrediction:
         """
         Predict the shot type from a keypoint sequence.
+
+        Applies a biomechanical gate first: if the wrist speed and
+        acceleration are both below threshold (no arm swing detected),
+        the window is classified as "no_shot" without even querying
+        the LSTM, preventing false positives during footwork/idle.
 
         Args:
             keypoint_sequence: numpy array of shape (T, 13, 2) where
                                T = number of frames.
+            frame_skip: frames skipped between entries (for velocity calc).
+            fps: source video frame rate.
 
         Returns:
             ShotPrediction with shot_type, confidence, and full probabilities.
         """
+        # ── Biomechanical gate ──
+        is_shot, peak_speed, peak_accel = self._check_swing_gate(
+            keypoint_sequence, frame_skip=frame_skip, fps=fps
+        )
+
+        if not is_shot:
+            return ShotPrediction(
+                shot_type="no_shot",
+                confidence=0.0,
+                all_probabilities={name: 0.0 for name in SHOT_CLASSES},
+                is_shot=False,
+            )
+
+        # ── LSTM prediction (only reached when a swing is detected) ──
         self._load_model()
 
-        # Reshape: (T, 13, 2) → apply feature engineering
         if self.model_type == "side":
             from cv_model.features import compute_side_angle_features
-            enhanced_seq = compute_side_angle_features(keypoint_sequence)
+            enhanced_seq = compute_side_angle_features(keypoint_sequence,
+                                                       fps=fps, frame_skip=frame_skip)
         else:
             from cv_model.features import compute_kinematic_features
-            enhanced_seq = compute_kinematic_features(keypoint_sequence)
-        
+            enhanced_seq = compute_kinematic_features(keypoint_sequence,
+                                                      fps=fps, frame_skip=frame_skip)
+
         # Batch dimension: (1, T, features)
         flat = np.expand_dims(enhanced_seq, axis=0)
 
         # Run prediction
-        probs = self._model.predict(flat, verbose=0)  # (1, 6)
-        probs = probs[0]  # (6,)
+        probs = self._model.predict(flat, verbose=0)  # (1, num_classes)
+        probs = probs[0]
 
         predicted_idx = int(np.argmax(probs))
         confidence = float(probs[predicted_idx])
@@ -166,6 +259,7 @@ class LSTMShotModel:
             shot_type=shot_type,
             confidence=confidence,
             all_probabilities=all_probs,
+            is_shot=True,
         )
 
 
@@ -266,32 +360,46 @@ class ShotPredictor:
         player = players[primary_player_id]
         logger.info(f"Primary player: {primary_player_id} (score: {get_movement_score(player):.2f}, {player.num_frames} frames)")
 
-        # Step 2: Sliding window classification
+        # Step 2: Get video fps for biomechanical calculations
+        _cap = cv2.VideoCapture(video_path)
+        video_fps = _cap.get(cv2.CAP_PROP_FPS) or 30.0
+        _cap.release()
+
+        # Step 3: Sliding window classification with biomechanical gate
         sequence = player.to_numpy()  # (T, 13, 2)
         T = sequence.shape[0]
-        predictions: List[ShotPrediction] = []
+        all_predictions: List[ShotPrediction] = []
 
         if T < window_size:
             # Pad shorter sequences
             padded = np.zeros((window_size, 13, 2))
             padded[:T] = sequence
-            pred = self.lstm_model.predict(padded)
+            pred = self.lstm_model.predict(padded, frame_skip=frame_skip, fps=video_fps)
             pred.player_id = primary_player_id
             pred.frame_range = (start_frame, start_frame + (T - 1) * frame_skip)
-            predictions.append(pred)
+            all_predictions.append(pred)
         else:
             # Sliding window
             for w_start in range(0, T - window_size + 1, stride):
                 window = sequence[w_start:w_start + window_size]
-                pred = self.lstm_model.predict(window)
+                pred = self.lstm_model.predict(window, frame_skip=frame_skip, fps=video_fps)
                 pred.player_id = primary_player_id
                 pred.frame_range = (
                     start_frame + (w_start * frame_skip),
                     start_frame + ((w_start + window_size - 1) * frame_skip)
                 )
-                predictions.append(pred)
+                all_predictions.append(pred)
+
+        # Separate real shot detections from idle/footwork windows
+        predictions = [p for p in all_predictions if p.is_shot]
+        suppressed = [p for p in all_predictions if not p.is_shot]
 
         # Log results to console
+        if suppressed:
+            logger.info(f"  Biomechanical gate suppressed {len(suppressed)}/{len(all_predictions)} "
+                        f"windows (no arm swing detected)")
+        if not predictions:
+            logger.info("  No shots detected in this video (all windows below swing threshold).")
         for p in predictions:
             logger.info(f"  Frames {p.frame_range}: {p.shot_type.upper()} ({p.confidence:.1%})")
 
@@ -533,12 +641,13 @@ class ShotPredictor:
 def _shot_color(shot_type: str) -> Tuple[int, int, int]:
     """Return a distinct BGR color for each shot type."""
     colors = {
-        'clear':  (255, 200, 0),     # cyan-ish
-        'drive':  (0, 200, 255),     # orange
-        'drop':   (0, 255, 100),     # green
-        'lob':    (255, 100, 255),   # magenta
-        'net':    (100, 255, 255),   # yellow
-        'smash':  (0, 0, 255),       # red
+        'clear':   (255, 200, 0),     # cyan-ish
+        'drive':   (0, 200, 255),     # orange
+        'drop':    (0, 255, 100),     # green
+        'lob':     (255, 100, 255),   # magenta
+        'net':     (100, 255, 255),   # yellow
+        'smash':   (0, 0, 255),       # red
+        'no_shot': (120, 120, 120),   # grey (idle / footwork)
     }
     return colors.get(shot_type, (200, 200, 200))
 
@@ -633,10 +742,20 @@ def main():
             crop_region=crop_region,
         )
 
+        # Filter: only show actual shot detections in the summary
+        shot_results = [r for r in results if r.is_shot]
+        no_shot_count = len(results) - len(shot_results)
+
         print("\n" + "═" * 60)
         print("  SHOT CLASSIFICATION RESULTS")
         print("═" * 60)
-        for i, pred in enumerate(results):
+        if no_shot_count > 0:
+            print(f"  ({no_shot_count} windows suppressed — no arm swing detected)")
+            print()
+        if not shot_results:
+            print("  No shots detected in this video.")
+            print("  The player may have been doing footwork or not hitting.")
+        for i, pred in enumerate(shot_results):
             print(f"  [{i+1}] Frames {pred.frame_range[0]:>5}–{pred.frame_range[1]:<5}  "
                   f"{pred.shot_type.upper():<8} {pred.confidence:>6.1%}")
             for shot, prob in sorted(pred.all_probabilities.items(), key=lambda x: -x[1]):
